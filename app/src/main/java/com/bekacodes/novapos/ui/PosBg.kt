@@ -1,4 +1,4 @@
-package com.bekacodes.novapos.ui
+package com.example.novapos.presentation
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.*
@@ -34,6 +34,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.bekacodes.novapos.ui.ItemDepartmentTag
+import com.bekacodes.novapos.ui.MenuCategoryFilter
+import com.bekacodes.novapos.ui.NovaPosIntent
+import com.bekacodes.novapos.ui.NovaPosUiState
+import com.bekacodes.novapos.ui.PosMenuItem
 
 // Exact Color Palette from Figma Design
 val PosBg = Color(0xFF070A10)
@@ -228,7 +233,7 @@ private fun TopPosHeader(
                         color = if (uiState.isOnline) PosEmerald.copy(alpha = 0.45f) else PosAmber.copy(alpha = 0.6f),
                         shape = RoundedCornerShape(9.dp)
                     )
-                    .clickable { onIntent(NovaPosIntent.ToggleOnlineConnectivity) }
+                    .clickable { onIntent(NovaPosIntent.ToggleOnlineSafMode) }
                     .padding(horizontal = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(14.dp)
