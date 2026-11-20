@@ -7,16 +7,19 @@ import androidx.activity.viewModels
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.bekacodes.novapos.data.NovaPosDatabase
+import com.bekacodes.novapos.hardware.nfc.SoftPosNfcReader
 import com.bekacodes.novapos.ui.NovaPosViewModel
 import com.example.novapos.presentation.NovaPosScreen
+import dagger.hilt.android.AndroidEntryPoint
+import javax.inject.Inject
 
+@AndroidEntryPoint
 class MainActivity : ComponentActivity() {
 
-    private val database by lazy { NovaPosDatabase.getInstance(applicationContext) }
-    private val viewModel: NovaPosViewModel by viewModels {
-        NovaPosViewModel.provideFactory(database.dao())
-    }
+    @Inject
+    lateinit var nfcReader: SoftPosNfcReader
+
+    private val viewModel: NovaPosViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -29,5 +32,15 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        nfcReader.startReaderMode(this)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        nfcReader.stopReaderMode(this)
     }
 }

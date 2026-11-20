@@ -1,12 +1,17 @@
 package com.bekacodes.novapos.ui
 
 import androidx.lifecycle.ViewModel
-import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import androidx.work.WorkManager
 import com.bekacodes.novapos.data.NovaPosDao
+import com.bekacodes.novapos.data.SafSyncWorker
 import com.bekacodes.novapos.data.SafTransactionEntity
 import com.bekacodes.novapos.domain.AiCashierAgent
 import com.bekacodes.novapos.hardware.EscPosEncoder
+import com.bekacodes.novapos.hardware.nfc.EmvApduResult
+import com.bekacodes.novapos.hardware.nfc.SoftPosNfcReader
+import com.bekacodes.novapos.hardware.printer.UsbEscPosPrinterTransport
+import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -14,25 +19,40 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.UUID
+import javax.inject.Inject
 import kotlin.random.Random
 import kotlin.time.Duration.Companion.milliseconds
 
-class NovaPosViewModel(
+@HiltViewModel
+class NovaPosViewModel @Inject constructor(
     private val dao: NovaPosDao,
-    private val aiCashier: AiCashierAgent = AiCashierAgent(),
-    private val escPosEncoder: EscPosEncoder = EscPosEncoder()
+    private val aiCashier: AiCashierAgent,
+    private val escPosEncoder: EscPosEncoder,
+    private val nfcReader: SoftPosNfcReader,
+    private val usbPrinterTransport: UsbEscPosPrinterTransport,
+    private val workManager: WorkManager?
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(NovaPosUiState())
     val uiState: StateFlow<NovaPosUiState> = _uiState.asStateFlow()
 
     init {
-        // Reactively observe the SQLite Store-and-Forward (SAF) unsynced transaction count
+        // 1. Observe SQLite Store-and-Forward (SAF) unsynced transaction count
         viewModelScope.launch {
             dao.observePendingSafCount().collect { unsyncedCount ->
                 _uiState.update { it.copy(safQueueCount = unsyncedCount) }
             }
         }
+
+        // 2. Observe live NFC hardware card taps via SoftPosNfcReader
+        viewModelScope.launch {
+            nfcReader.apduResults.collect { result ->
+                processLiveNfcApduTap(result)
+            }
+        }
+
+        // 3. Schedule periodic background SAF worker sync
+        workManager?.let { SafSyncWorker.schedulePeriodicSync(it) }
     }
 
     fun onIntent(intent: NovaPosIntent) {
@@ -107,8 +127,11 @@ class NovaPosViewModel(
                         }
                     )
                 }
-                if (nextOnline && _uiState.value.safQueueCount > 0) {
-                    onIntent(NovaPosIntent.SyncSafQueueNow)
+                if (nextOnline) {
+                    workManager?.let { SafSyncWorker.enqueueOneTimeSync(it) }
+                    if (_uiState.value.safQueueCount > 0) {
+                        onIntent(NovaPosIntent.SyncSafQueueNow)
+                    }
                 }
             }
 
@@ -122,6 +145,8 @@ class NovaPosViewModel(
                                 aiStatusBanner = "✓ Flushed $flushedCount offline SAF transaction(s) to acquiring host with UUID idempotency keys"
                             )
                         }
+                    } else {
+                        workManager?.let { SafSyncWorker.enqueueOneTimeSync(it) }
                     }
                 }
             }
@@ -188,6 +213,75 @@ class NovaPosViewModel(
         }
     }
 
+    private fun processLiveNfcApduTap(result: EmvApduResult) {
+        val snapshot = _uiState.value
+        if (snapshot.ticketLines.isEmpty() || snapshot.perPersonSplitUsd <= 0.0) return
+
+        viewModelScope.launch {
+            val arqc = result.arqcHex
+            val idempotencyKey = "idem_${UUID.randomUUID()}"
+
+            _uiState.update {
+                it.copy(
+                    softPosStatus = SoftPosStatus.READING_APDU,
+                    apduCommandLog = result.commandHex,
+                    apduResponseLog = result.responseHex
+                )
+            }
+
+            val isOnlineNow = _uiState.value.isOnline
+            dao.insertTransactionIdempotent(
+                SafTransactionEntity(
+                    idempotencyKey = idempotencyKey,
+                    orderNumber = snapshot.orderNumber,
+                    splitPersonIndex = snapshot.currentSplitPerson,
+                    splitTotalWays = snapshot.splitWays,
+                    amountChargedUsd = snapshot.perPersonSplitUsd,
+                    arqcCryptogram = arqc,
+                    isSynced = isOnlineNow
+                )
+            )
+
+            _uiState.update { state ->
+                val isLastSplit = state.currentSplitPerson >= state.splitWays
+                val updatedCatalog = if (isLastSplit) {
+                    state.menuCatalog.map { catItem ->
+                        val orderedQty = state.quantityInOrder(catItem.id)
+                        if (orderedQty > 0) {
+                            catItem.copy(
+                                stockLeft = (catItem.stockLeft - orderedQty).coerceAtLeast(0)
+                            )
+                        } else {
+                            catItem
+                        }
+                    }
+                } else {
+                    state.menuCatalog
+                }
+
+                val nextStatus = if (isOnlineNow) SoftPosStatus.APPROVED else SoftPosStatus.QUEUED_SAF
+                val statusMsg = if (isOnlineNow) {
+                    "✓ NFC Contactless Card Approved $${
+                        String.format("%.2f", state.perPersonSplitUsd)
+                    } (Person ${state.currentSplitPerson}/${state.splitWays}) · ARQC $arqc"
+                } else {
+                    "Queued $${
+                        String.format("%.2f", state.perPersonSplitUsd)
+                    } in Offline SAF Ledger (Idempotency: ${idempotencyKey.take(12)})"
+                }
+
+                state.copy(
+                    menuCatalog = updatedCatalog,
+                    currentSplitPerson = if (isLastSplit) 1 else state.currentSplitPerson + 1,
+                    softPosStatus = nextStatus,
+                    apduCommandLog = result.commandHex,
+                    apduResponseLog = result.responseHex,
+                    aiStatusBanner = statusMsg
+                )
+            }
+        }
+    }
+
     private fun processSoftPosEmvTap() {
         val snapshot = _uiState.value
         if (snapshot.ticketLines.isEmpty() || snapshot.perPersonSplitUsd <= 0.0) return
@@ -228,9 +322,7 @@ class NovaPosViewModel(
                         val orderedQty = state.quantityInOrder(catItem.id)
                         if (orderedQty > 0) {
                             catItem.copy(
-                                stockLeft = (catItem.stockLeft - orderedQty).coerceAtLeast(
-                                    0
-                                )
+                                stockLeft = (catItem.stockLeft - orderedQty).coerceAtLeast(0)
                             )
                         } else {
                             catItem
@@ -244,17 +336,11 @@ class NovaPosViewModel(
                     if (isOnlineNow) SoftPosStatus.APPROVED else SoftPosStatus.QUEUED_SAF
                 val statusMsg = if (isOnlineNow) {
                     "Approved $${
-                        String.format(
-                            "%.2f",
-                            state.perPersonSplitUsd
-                        )
+                        String.format("%.2f", state.perPersonSplitUsd)
                     } (Person ${state.currentSplitPerson}/${state.splitWays}) · ARQC $arqc"
                 } else {
                     "Queued $${
-                        String.format(
-                            "%.2f",
-                            state.perPersonSplitUsd
-                        )
+                        String.format("%.2f", state.perPersonSplitUsd)
                     } in Offline SAF Ledger (Idempotency: ${idempotencyKey.take(12)})"
                 }
 
@@ -265,10 +351,7 @@ class NovaPosViewModel(
                     apduCommandLog = "> 80 AE 80 00   ARQC=$arqc AID=A0000000031010",
                     apduResponseLog = if (isOnlineNow) {
                         "> 9000 OK       AUTH APPROVED ($${
-                            String.format(
-                                "%.2f",
-                                state.perPersonSplitUsd
-                            )
+                            String.format("%.2f", state.perPersonSplitUsd)
                         })"
                     } else {
                         "> 9000 SAF      STORED OFFLINE (${idempotencyKey.take(12)})"
@@ -282,21 +365,15 @@ class NovaPosViewModel(
     private fun spoolEscPosReceipt() {
         val current = _uiState.value
         val job = escPosEncoder.encodeReceipt(current)
-        _uiState.update {
-            it.copy(
-                lastPrintedHexSummary = job.hexPreview,
-                aiStatusBanner = "🖨 Spooled ${job.byteLength} bytes to 80mm ESC/POS USB endpoint (${job.hexPreview})"
-            )
-        }
-    }
 
-    companion object {
-        fun provideFactory(dao: NovaPosDao): ViewModelProvider.Factory =
-            object : ViewModelProvider.Factory {
-                @Suppress("UNCHECKED_CAST")
-                override fun <T : ViewModel> create(modelClass: Class<T>): T {
-                    return NovaPosViewModel(dao) as T
-                }
+        viewModelScope.launch {
+            val printResult = usbPrinterTransport.printReceipt(job)
+            _uiState.update {
+                it.copy(
+                    lastPrintedHexSummary = job.hexPreview,
+                    aiStatusBanner = "🖨 ${printResult.message}"
+                )
             }
+        }
     }
 }
